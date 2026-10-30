@@ -1101,9 +1101,27 @@ fn parse_dcs(buffer: &[u8]) -> Result<Option<Event>> {
             };
             let s = str::from_utf8(&buffer[5..buffer.len() - 3])?;
             let mut sgrs = Vec::new();
-            // TODO: is this correct? What about terminals that use ';' for true colors?
-            for sgr in s.split(';') {
-                sgrs.push(parse_sgr(sgr)?);
+            let mut params = s.split(';');
+            while let Some(param) = params.next() {
+                match param {
+                    // Extended colors may also be written with semicolons (`38;2;r;g;b` or
+                    // `38;5;n`), as xterm does. Rejoin them with colons for `parse_sgr`.
+                    "38" | "48" | "58" => {
+                        let kind = params.next().ok_or(MalformedSequenceError)?;
+                        let count = match kind {
+                            "2" => 3,
+                            "5" => 1,
+                            _ => bail!(),
+                        };
+                        let mut joined = format!("{param}:{kind}");
+                        for _ in 0..count {
+                            joined.push(':');
+                            joined.push_str(params.next().ok_or(MalformedSequenceError)?);
+                        }
+                        sgrs.push(parse_sgr(&joined)?);
+                    }
+                    _ => sgrs.push(parse_sgr(param)?),
+                }
             }
             Ok(Some(Event::Dcs(dcs::Dcs::Response {
                 is_request_valid,
@@ -1263,6 +1281,39 @@ mod test {
                 )])
             })
         );
+    }
+
+    #[test]
+    fn parse_dcs_sgr_semicolon_extended_colors() {
+        // contour writes extended colors in DECRPSS replies with semicolons rather than colons.
+        let event = parse_event(b"\x1bP1$r0;38;2;12;34;56;48;5;236m\x1b\\", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            event,
+            Event::Dcs(dcs::Dcs::Response {
+                is_request_valid: true,
+                value: dcs::DcsResponse::GraphicRendition(vec![
+                    csi::Sgr::Reset,
+                    csi::Sgr::Foreground(style::RgbColor::new(12, 34, 56).into()),
+                    csi::Sgr::Background(style::ColorSpec::PaletteIndex(236)),
+                ])
+            })
+        );
+        // The colon form still parses the same way.
+        assert_eq!(
+            parse_event(b"\x1bP1$r38:2::12:34:56m\x1b\\", false)
+                .unwrap()
+                .unwrap(),
+            Event::Dcs(dcs::Dcs::Response {
+                is_request_valid: true,
+                value: dcs::DcsResponse::GraphicRendition(vec![csi::Sgr::Foreground(
+                    style::RgbColor::new(12, 34, 56).into()
+                )])
+            })
+        );
+        // A truncated extended color is malformed.
+        assert!(parse_event(b"\x1bP1$r38;2;12;34m\x1b\\", false).is_err());
     }
 
     #[test]
