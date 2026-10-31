@@ -1191,9 +1191,29 @@ fn parse_sgr(buffer: &str) -> Result<csi::Sgr> {
         "107" => Sgr::Background(ColorSpec::BRIGHT_WHITE),
         "59" => Sgr::UnderlineColor(ColorSpec::Reset),
         _ => {
-            let mut split = buffer.split(':').filter(|s| !s.is_empty());
-            let first = next_parsed::<u8>(&mut split)?;
-            let color = match next_parsed::<u8>(&mut split)? {
+            let mut split = buffer.split(':');
+            let (first, kind) = {
+                let mut fields = split.by_ref().filter(|s| !s.is_empty());
+                (
+                    next_parsed::<u8>(&mut fields)?,
+                    next_parsed::<u8>(&mut fields)?,
+                )
+            };
+            let mut rest: Vec<&str> = split.collect();
+            // A direct color can name a color space before its channels, as ITU T.416 has it
+            // (`38:2:<id>:r:g:b`, with the ID often left empty: `38:2::r:g:b`), or leave it out
+            // (`38:2:r:g:b`). The number of fields after the kind tells which, so a direct
+            // color's fields are read by position. Other fields skip empty ones, as before.
+            let channels = match kind {
+                2 => 3,
+                6 => 4,
+                _ => 0,
+            };
+            if channels > 0 && rest.len() > channels {
+                rest.remove(0);
+            }
+            let mut split = rest.into_iter().filter(|s| channels > 0 || !s.is_empty());
+            let color = match kind {
                 2 => RgbColor {
                     red: next_parsed::<u8>(&mut split)?,
                     green: next_parsed::<u8>(&mut split)?,
@@ -1262,6 +1282,50 @@ mod test {
                     style::Underline::Curly
                 )])
             })
+        );
+    }
+
+    #[test]
+    fn parse_dcs_sgr_direct_colors_with_or_without_a_color_space() {
+        let attributes = |bytes: &[u8]| match parse_event(bytes, false) {
+            Ok(Some(Event::Dcs(dcs::Dcs::Response {
+                value: dcs::DcsResponse::GraphicRendition(sgrs),
+                ..
+            }))) => sgrs,
+            other => panic!("{other:?}"),
+        };
+        let rgb = csi::Sgr::Foreground(style::RgbColor::new(12, 34, 56).into());
+        // kitty leaves the color space out, most terminals leave it empty, and iTerm2 fills it in.
+        assert_eq!(attributes(b"\x1bP1$r38:2:12:34:56m\x1b\\"), vec![rgb]);
+        assert_eq!(attributes(b"\x1bP1$r38:2::12:34:56m\x1b\\"), vec![rgb]);
+        assert_eq!(
+            attributes(b"\x1bP1$r0;38:2:1:12:34:56m\x1b\\"),
+            vec![csi::Sgr::Reset, rgb]
+        );
+        // The further ITU T.416 fields after the channels are ignored.
+        assert_eq!(
+            attributes(b"\x1bP1$r38:2:1:12:34:56:0:0:0m\x1b\\"),
+            vec![rgb]
+        );
+        // Likewise with an alpha channel.
+        let rgba = csi::Sgr::Foreground(
+            style::RgbaColor {
+                red: 12,
+                green: 34,
+                blue: 56,
+                alpha: 128,
+            }
+            .into(),
+        );
+        assert_eq!(attributes(b"\x1bP1$r38:6:12:34:56:128m\x1b\\"), vec![rgba]);
+        assert_eq!(
+            attributes(b"\x1bP1$r38:6:1:12:34:56:128m\x1b\\"),
+            vec![rgba]
+        );
+        // An indexed color still skips empty fields.
+        assert_eq!(
+            attributes(b"\x1bP1$r38:5::12m\x1b\\"),
+            vec![csi::Sgr::Foreground(style::ColorSpec::PaletteIndex(12))]
         );
     }
 
