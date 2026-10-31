@@ -104,6 +104,12 @@ impl Parser {
         self.events.pop_front()
     }
 
+    /// Whether the buffer holds just an Escape, which may start a key's sequence.
+    #[cfg(windows)]
+    pub(crate) fn escape_pending(&self) -> bool {
+        self.buffer == *b"\x1B"
+    }
+
     /// Adds bytes to the parser and queues any completed events.
     ///
     /// Set `maybe_more` to `true` when the input source may provide more bytes for the same

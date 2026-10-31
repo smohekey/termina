@@ -5,6 +5,11 @@ use std::{
     mem,
     os::windows::prelude::*,
     ptr,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use windows_sys::Win32::{
@@ -397,6 +402,9 @@ pub struct WindowsTerminal {
     original_output_cp: CodePageID,
     has_panic_hook: bool,
     mode: InputReaderMode,
+    /// How long a lone Escape waits for the rest of a key, in milliseconds; shared with the event
+    /// source.
+    escape_wait: Arc<AtomicU32>,
 }
 
 impl WindowsTerminal {
@@ -428,6 +436,7 @@ impl WindowsTerminal {
         let original_output_mode = output.get_mode()?;
         let original_input_cp = input.get_code_page()?;
         let original_output_cp = output.get_code_page()?;
+        let escape_wait = Arc::new(AtomicU32::new(0));
 
         // Switch the console to UTF-8 + VT modes. Each step mutates global console state, and a
         // later step can fail. Because there is no `WindowsTerminal` yet, `Drop` won't run, so on
@@ -464,6 +473,7 @@ impl WindowsTerminal {
             Ok(EventReader::new(WindowsEventSource::new(
                 input.try_clone()?,
                 mode,
+                escape_wait.clone(),
             )?))
         })() {
             Ok(reader) => reader,
@@ -486,7 +496,23 @@ impl WindowsTerminal {
             original_output_cp,
             mode,
             has_panic_hook: false,
+            escape_wait,
         })
+    }
+
+    /// Sets how long a lone Escape at the end of the input read so far waits for the rest of a key
+    /// before it is reported as the Escape key. Alt+B, for example, arrives as Escape then `b`,
+    /// which can be split across reads. The default, zero, reports a lone Escape at once.
+    ///
+    /// The wait runs from when the Escape is read. Input read after it has run out is never joined
+    /// to the Escape, even if it arrived in time, so for the wait to be measured accurately keep a
+    /// [`read`](crate::EventReader::read) or [`poll`](crate::EventReader::poll) call waiting, for
+    /// example on a thread of its own.
+    ///
+    /// This affects [VTE input mode][InputReaderMode::Vte] only.
+    pub fn set_escape_wait(&mut self, wait: Duration) {
+        let millis = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
+        self.escape_wait.store(millis, Ordering::Relaxed);
     }
 }
 

@@ -39,7 +39,18 @@ pub enum InputReaderMode {
 }
 
 impl Parser {
-    pub(crate) fn decode_input_records(&mut self, records: &[Console::INPUT_RECORD]) {
+    /// Decodes a batch of console input records. With `hold_escape`, a lone Escape left at the end
+    /// of the batch stays pending, in case the rest of a key follows (Alt+B arrives as Escape,
+    /// then `b`); otherwise it is the Escape key.
+    ///
+    /// Returns whether the batch held any input bytes. If it did, an Escape held from before has
+    /// been used up, so one pending now is a new one.
+    pub(crate) fn decode_input_records(
+        &mut self,
+        records: &[Console::INPUT_RECORD],
+        hold_escape: bool,
+    ) -> bool {
+        let mut took_input = false;
         for record in records {
             match record.EventType as u32 {
                 Console::KEY_EVENT => {
@@ -59,6 +70,7 @@ impl Parser {
                             // `read_console_input` uses `ReadConsoleInputA` so we should treat the
                             // key code as a byte and add it to the buffer.
                             self.buffer.push(byte);
+                            took_input = true;
                             self.process_bytes(true);
                         }
                         InputReaderMode::Legacy => {
@@ -116,8 +128,9 @@ impl Parser {
             }
         }
         if self.mode == InputReaderMode::Vte {
-            self.process_bytes(false);
+            self.process_bytes(hold_escape && self.escape_pending());
         }
+        took_input
     }
 }
 
@@ -656,5 +669,80 @@ pub(crate) mod legacy {
             row: ypos,
             modifiers,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{KeyCode, KeyEvent, Modifiers};
+
+    /// A key-down record carrying `byte`, as the console sends in VTE input mode.
+    fn key_down(byte: u8) -> Console::INPUT_RECORD {
+        let mut record: Console::INPUT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventType = Console::KEY_EVENT as u16;
+        let mut key: Console::KEY_EVENT_RECORD = unsafe { std::mem::zeroed() };
+        key.bKeyDown = 1;
+        key.uChar.AsciiChar = byte as _;
+        record.Event.KeyEvent = key;
+        record
+    }
+
+    /// A key-up record carrying `byte`, which the decoder skips.
+    fn key_up(byte: u8) -> Console::INPUT_RECORD {
+        let mut record = key_down(byte);
+        record.Event.KeyEvent.bKeyDown = 0;
+        record
+    }
+
+    fn key(code: KeyCode, modifiers: Modifiers) -> Option<Event> {
+        Some(Event::Key(KeyEvent::new(code, modifiers)))
+    }
+
+    #[test]
+    fn a_lone_escape_ending_a_batch_is_the_escape_key() {
+        let mut parser = Parser::with_mode(InputReaderMode::Vte);
+        parser.decode_input_records(&[key_down(0x1b)], false);
+        assert_eq!(parser.pop(), key(KeyCode::Escape, Modifiers::NONE));
+    }
+
+    #[test]
+    fn a_held_escape_joins_the_key_in_the_next_batch() {
+        let mut parser = Parser::with_mode(InputReaderMode::Vte);
+        parser.decode_input_records(&[key_down(0x1b)], true);
+        assert_eq!(parser.pop(), None);
+        assert!(parser.escape_pending());
+        parser.decode_input_records(&[key_down(b'b')], true);
+        assert_eq!(parser.pop(), key(KeyCode::Char('b'), Modifiers::ALT));
+        assert!(!parser.escape_pending());
+    }
+
+    #[test]
+    fn a_held_escape_with_nothing_after_it_is_the_escape_key() {
+        let mut parser = Parser::with_mode(InputReaderMode::Vte);
+        parser.decode_input_records(&[key_down(0x1b)], true);
+        parser.parse(&[], false);
+        assert_eq!(parser.pop(), key(KeyCode::Escape, Modifiers::NONE));
+    }
+
+    #[test]
+    fn an_escape_pending_after_new_input_is_a_new_one() {
+        let mut parser = Parser::with_mode(InputReaderMode::Vte);
+        assert!(parser.decode_input_records(&[key_down(0x1b)], true));
+        // A batch with no input bytes leaves the same Escape waiting.
+        assert!(!parser.decode_input_records(&[key_up(0x1b)], true));
+        assert!(parser.escape_pending());
+        // `b` completes Alt+B with the held Escape, and the Escape after it starts a new key.
+        assert!(parser.decode_input_records(&[key_down(b'b'), key_down(0x1b)], true));
+        assert_eq!(parser.pop(), key(KeyCode::Char('b'), Modifiers::ALT));
+        assert_eq!(parser.pop(), None);
+        assert!(parser.escape_pending());
+    }
+
+    #[test]
+    fn an_alt_key_in_one_batch_needs_no_wait() {
+        let mut parser = Parser::with_mode(InputReaderMode::Vte);
+        parser.decode_input_records(&[key_down(0x1b), key_down(b'b')], true);
+        assert_eq!(parser.pop(), key(KeyCode::Char('b'), Modifiers::ALT));
     }
 }
